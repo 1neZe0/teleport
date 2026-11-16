@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -26,14 +28,17 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	gwebsocket "github.com/gorilla/websocket"
 	"github.com/gravitational/trace"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/portforward"
 	clientremotecommand "k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport"
 
@@ -67,16 +72,14 @@ type wsStreamClient struct {
 	cacheBuff *bytes.Buffer
 	conn      *gwebsocket.Conn
 	mu        *sync.Mutex
-	localPort *int32
 	readyChan chan struct{}
 	listener  net.Listener
 }
 
 type websocketOption func(*wsStreamClient)
 
-func withLocalPortforwarding(port int32, readyChan chan struct{}) websocketOption {
+func withLocalPortforwarding(readyChan chan struct{}) websocketOption {
 	return func(c *wsStreamClient) {
-		c.localPort = &port
 		c.readyChan = readyChan
 	}
 }
@@ -131,6 +134,15 @@ func (e *wsStreamClient) StreamWithContext(_ context.Context, options clientremo
 	return trace.Wrap(e.Stream(options))
 }
 
+func (e *wsStreamClient) GetPorts() ([]portforward.ForwardedPort, error) {
+	return []portforward.ForwardedPort{
+		{
+			Local:  uint16(e.listener.Addr().(*net.TCPAddr).Port),
+			Remote: 8080,
+		},
+	}, nil
+}
+
 // Stream copies the contents from stdin into the connection and respective stdout and stderr
 // from the connection into the desired buffers.
 // This method will block until the server closes the connection.
@@ -171,13 +183,7 @@ func (e *wsStreamClient) Stream(options clientremotecommand.StreamOptions) error
 	defer conn.Close()
 	streamingProto := conn.Subprotocol()
 
-	found := false
-	for _, p := range supportedProtocols {
-		if p == streamingProto {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(supportedProtocols, streamingProto)
 	if !found {
 		return fmt.Errorf("unsupported streaming protocol: %q", streamingProto)
 	}
@@ -201,13 +207,7 @@ func (e *wsStreamClient) ForwardPorts() error {
 	defer conn.Close()
 	streamingProto := conn.Subprotocol()
 
-	found := false
-	for _, p := range supportedProtocols {
-		if p == streamingProto {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(supportedProtocols, streamingProto)
 	if !found {
 		return fmt.Errorf("unsupported streaming protocol: %q", streamingProto)
 	}
@@ -251,6 +251,7 @@ func (e *wsStreamClient) Close() {
 //	CLOSE
 func (e *wsStreamClient) stream(conn *gwebsocket.Conn, options clientremotecommand.StreamOptions) error {
 	errChan := make(chan error, 3)
+	statusReport := &atomic.Bool{}
 	wg := sync.WaitGroup{}
 	if options.Stdin != nil {
 		wg.Add(1)
@@ -310,7 +311,7 @@ func (e *wsStreamClient) stream(conn *gwebsocket.Conn, options clientremotecomma
 				case streamStderr:
 					w = options.Stderr
 				case streamErr:
-					_, err := parseError(buf[1:])
+					_, err := parseError(buf[1:], statusReport)
 					errChan <- err
 					// Once we receive an error from streamErr, we must stop processing.
 					// The server also stops the execution and closes the connection.
@@ -324,7 +325,7 @@ func (e *wsStreamClient) stream(conn *gwebsocket.Conn, options clientremotecomma
 				}
 				e.mu.Lock()
 				// the stdout and stderr streams receive the last stdin input and we must trim it.
-				s := strings.Replace(string(buf[1:]), e.cacheBuff.String(), "", -1)
+				s := strings.ReplaceAll(string(buf[1:]), e.cacheBuff.String(), "")
 				e.mu.Unlock()
 				_, err = w.Write([]byte(s))
 				if err != nil {
@@ -336,10 +337,9 @@ func (e *wsStreamClient) stream(conn *gwebsocket.Conn, options clientremotecomma
 			if err != nil {
 				// check the connection was properly closed by server, and if true ignore the error.
 				var websocketErr *gwebsocket.CloseError
-				if errors.As(err, &websocketErr) && websocketErr.Code == gwebsocket.CloseNormalClosure {
-					err = nil
+				if errors.As(err, &websocketErr) && websocketErr.Code != gwebsocket.CloseNormalClosure {
+					errChan <- err
 				}
-				errChan <- err
 				return
 			}
 			e.mu.Lock()
@@ -351,7 +351,15 @@ func (e *wsStreamClient) stream(conn *gwebsocket.Conn, options clientremotecomma
 
 	wg.Wait()
 	close(errChan)
+	// always expect an error from the errChan since it means that the connection was closed
+	// by the server by sending a streamErr with the error.
+	// If no error happened during the remote execution, the server sends a streamErr with
+	// status = Success field.
 	err := <-errChan
+	// only check if status was reported on success.
+	if err == nil && !statusReport.Load() {
+		return trace.ConnectionProblem(nil, "server didn't report exec status using the error websocket channel")
+	}
 	return err
 }
 
@@ -368,14 +376,15 @@ const (
 // Due to portforward websocket limitations, the listener do not accept
 // concurrent connections.
 func (e *wsStreamClient) portforward(remoteConn *gwebsocket.Conn) (err error) {
-	if e.localPort == nil || e.readyChan == nil {
+	if e.readyChan == nil {
 		return trace.BadParameter("cannot use portforward without proper initialization")
 	}
 
-	e.listener, err = net.Listen("tcp", fmt.Sprintf("localhost:%d", *e.localPort))
+	e.listener, err = net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
 	close(e.readyChan)
 	for {
 		conn, err := e.listener.Accept()
@@ -452,7 +461,7 @@ func (e *wsStreamClient) handlePortForwardRequest(conn net.Conn, remoteConn *gwe
 						return
 					}
 				case portforwardErrChan:
-					err := trace.Errorf(string(buf[1:]))
+					err := trace.Errorf("%s", string(buf[1:]))
 					errChan <- trace.Wrap(err)
 					// Once we receive an error from streamErr, we must stop processing.
 					// The server also stops the execution and closes the connection.
@@ -510,7 +519,7 @@ func dial(rt http.RoundTripper, method string, url string) error {
 		// drain response body
 
 		_ = resp.Body.Close()
-		isStatusErr, err := parseError(responseErrorBytes)
+		isStatusErr, err := parseError(responseErrorBytes, nil)
 		if isStatusErr {
 			return err
 		}
@@ -542,9 +551,12 @@ func (e *wsStreamClient) RoundTrip(request *http.Request) (retResp *http.Respons
 }
 
 // parseError parses the error received from Kube API and checks if the returned error is *metav1.Status
-func parseError(errorBytes []byte) (bool, error) {
+func parseError(errorBytes []byte, statusReporter *atomic.Bool) (bool, error) {
 	if obj, _, err := statusCodecs.UniversalDecoder().Decode(errorBytes, nil, &metav1.Status{}); err == nil {
 		if status, ok := obj.(*metav1.Status); ok && status.Status == metav1.StatusSuccess {
+			if statusReporter != nil {
+				statusReporter.Store(true)
+			}
 			return true, nil
 		} else if ok {
 			return true, &apierrors.StatusError{ErrStatus: *status}

@@ -3,7 +3,7 @@
 > **Warning**  
 > This is a rough guide for using the provided systemd file in this directory. 
 > For detailed instructions on configuring Machine ID, see
-> https://goteleport.com/docs/machine-id/introduction/
+> https://goteleport.com/docs/machine-workload-identity/introduction/
 
 Create and fill out a configuration file for Machine ID at `/etc/tbot.yaml`.
 
@@ -31,8 +31,8 @@ destination directory so that this user is able to read from it and that the
 ```bash
 $ sudo tbot init \
     --destination-dir=/opt/machine-id \
-    --owner=teleport:teleport
-    --bot-user=teleport
+    --owner=teleport:teleport \
+    --bot-user=teleport \
     --reader-user=jenkins
 ```
 

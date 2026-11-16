@@ -31,7 +31,15 @@ type DatabaseService interface {
 	GetNamespace() string
 
 	// GetResourceMatchers returns the resource matchers of the DatabaseService.
+	// Database services deployed by Teleport have known configurations where
+	// we will only define a single resource matcher.
 	GetResourceMatchers() []*DatabaseResourceMatcher
+
+	// GetHostname returns the hostname where this Database Service is running.
+	GetHostname() string
+
+	// Clone creates a copy of the service.
+	Clone() DatabaseService
 }
 
 // NewDatabaseServiceV1 creates a new DatabaseService instance.
@@ -66,24 +74,14 @@ func (s *DatabaseServiceV1) GetResourceMatchers() []*DatabaseResourceMatcher {
 	return s.Spec.ResourceMatchers
 }
 
+// GetHostname returns the hostname where this Database Service is running.
+func (s *DatabaseServiceV1) GetHostname() string {
+	return s.Spec.Hostname
+}
+
 // GetNamespace returns the resource namespace.
 func (s *DatabaseServiceV1) GetNamespace() string {
 	return s.Metadata.Namespace
-}
-
-// GetAllLabels returns combined static and dynamic labels.
-func (s *DatabaseServiceV1) GetAllLabels() map[string]string {
-	return s.Metadata.Labels
-}
-
-// GetStaticLabels returns the static labels.
-func (s *DatabaseServiceV1) GetStaticLabels() map[string]string {
-	return s.Metadata.Labels
-}
-
-// SetStaticLabels sets the static labels.
-func (s *DatabaseServiceV1) SetStaticLabels(sl map[string]string) {
-	s.Metadata.Labels = sl
 }
 
 // MatchSearch goes through select field values and tries to
@@ -93,12 +91,7 @@ func (s *DatabaseServiceV1) MatchSearch(values []string) bool {
 	return MatchSearch(fieldVals, values, nil)
 }
 
-// Origin returns the origin value of the resource.
-func (s *DatabaseServiceV1) Origin() string {
-	return s.Metadata.Origin()
-}
-
-// SetOrigin sets the origin value of the resource.
-func (s *DatabaseServiceV1) SetOrigin(origin string) {
-	s.Metadata.SetOrigin(origin)
+// Clone creates a clone of this service.
+func (s *DatabaseServiceV1) Clone() DatabaseService {
+	return utils.CloneProtoMsg(s)
 }

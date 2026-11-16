@@ -1,28 +1,36 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
+	"context"
+	"io"
 	"os"
+	"os/exec"
 	"os/user"
 	"testing"
+	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	decisionpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/decision/v1alpha1"
 )
 
 func TestGetOwner(t *testing.T) {
@@ -50,7 +58,7 @@ func TestGetOwner(t *testing.T) {
 			},
 			outUID:  1000,
 			outGID:  5,
-			outMode: 0600,
+			outMode: 0o600,
 		},
 		// Group "tty" does not exist.
 		{
@@ -65,7 +73,7 @@ func TestGetOwner(t *testing.T) {
 			},
 			outUID:  1000,
 			outGID:  1000,
-			outMode: 0620,
+			outMode: 0o620,
 		},
 	}
 
@@ -77,4 +85,56 @@ func TestGetOwner(t *testing.T) {
 		require.Equal(t, tt.outGID, gid)
 		require.Equal(t, tt.outMode, mode)
 	}
+}
+
+func TestTerminal_KillUnderlyingShell(t *testing.T) {
+	t.Parallel()
+
+	srv := newMockServer(t)
+	scx := newTestServerContext(t, srv, nil, &decisionpb.SSHAccessPermit{})
+
+	shPath, err := exec.LookPath("sh")
+	require.NoError(t, err)
+	scx.execRequest.SetCommand(shPath)
+
+	term, err := newLocalTerminal(scx)
+	require.NoError(t, err)
+
+	term.SetTermType("xterm")
+
+	// Mark the terminal allocation to make sh wait indefinitely.
+	// Without it, sh quits immediately as stdin is not set.
+	scx.termAllocated = true
+
+	ctx := context.Background()
+
+	// Run sh
+	err = term.Run(ctx, io.Discard)
+	require.NoError(t, err)
+
+	errors := make(chan error)
+	go func() {
+		// Call wait to avoid creating zombie process.
+		// Ignore exit code as we're checking term.cmd.ProcessState already
+		errors <- term.Wait().Error
+	}()
+
+	// Continue execution
+	err = term.cmd.Continue()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	t.Cleanup(cancel)
+
+	err = term.KillUnderlyingShell(ctx)
+	require.NoError(t, err)
+
+	// Wait for the process to return.
+	require.NoError(t, <-errors)
+
+	// ProcessState should be not nil after the process exits.
+	require.NotNil(t, term.cmd.ProcessState)
+	require.NotZero(t, term.cmd.ProcessState.Pid())
+	// 255 is returned on subprocess kill.
+	require.Equal(t, 255, term.cmd.ProcessState.ExitCode())
 }

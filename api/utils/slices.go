@@ -17,6 +17,7 @@ limitations under the License.
 package utils
 
 import (
+	"slices"
 	"strings"
 )
 
@@ -45,18 +46,86 @@ func JoinStrings[T ~string](elems []T, sep string) T {
 	return T(b.String())
 }
 
-// Deduplicate deduplicates list of strings
-func Deduplicate(in []string) []string {
-	if len(in) == 0 {
+// Deduplicate deduplicates list of comparable values.
+func Deduplicate[T comparable](in []T) []T {
+	if len(in) <= 1 {
 		return in
 	}
-	out := make([]string, 0, len(in))
-	seen := make(map[string]bool, len(in))
+	out := make([]T, 0, len(in))
+	seen := make(map[T]struct{}, len(in))
 	for _, val := range in {
 		if _, ok := seen[val]; !ok {
 			out = append(out, val)
-			seen[val] = true
+			seen[val] = struct{}{}
 		}
 	}
 	return out
+}
+
+// DeduplicateAny deduplicates list of any values with compare function.
+func DeduplicateAny[T any](in []T, compare func(T, T) bool) []T {
+	if len(in) <= 1 {
+		return in
+	}
+	out := make([]T, 0, len(in))
+	for _, val := range in {
+		var seen bool
+		for _, outVal := range out {
+			if compare(val, outVal) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, val)
+		}
+	}
+	return out
+}
+
+// ContainSameUniqueElements returns true if the input slices contain the same
+// unique elements. Ordering and duplicates are ignored.
+func ContainSameUniqueElements[S ~[]E, E comparable](s1, s2 S) bool {
+	set1 := make(map[E]struct{}, len(s1))
+	for _, v := range s1 {
+		set1[v] = struct{}{}
+	}
+	set2 := make(map[E]struct{}, len(s2))
+	for _, v := range s2 {
+		if _, ok := set1[v]; !ok {
+			return false
+		}
+		set2[v] = struct{}{}
+	}
+	return len(set1) == len(set2)
+}
+
+// All checks if all elements of slice satisfy given predicate. If the slice is empty, it returns true.
+func All[S ~[]E, E any](s S, predicate func(E) bool) bool {
+	for _, e := range s {
+		if !predicate(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// CountBy counts the occurrences of each element in a slice based on a given mapper function.
+func CountBy[S ~[]E, E any](elements S, mapper func(E) string) map[string]int {
+	out := make(map[string]int)
+	for _, elem := range elements {
+		key := mapper(elem)
+		out[key] += 1
+	}
+	return out
+}
+
+// ContainsAll checks whether haystack contains all needles.
+func ContainsAll[S ~[]E, E comparable](haystack S, needles S) bool {
+	for _, needle := range needles {
+		if !slices.Contains(haystack, needle) {
+			return false
+		}
+	}
+	return true
 }

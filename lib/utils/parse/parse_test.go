@@ -1,18 +1,20 @@
 /*
-Copyright 2017-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package parse
 
@@ -25,123 +27,269 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestParseLabels(t *testing.T) {
+	// simplest case:
+	m, err := LabelSelectorSpec("key=value")
+	require.NotNil(t, m)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(m, map[string]string{
+		"key": "value",
+	}))
+
+	// multiple values:
+	m, err = LabelSelectorSpec(`type="database";" role"=master,ver="mongoDB v1,2"`)
+	require.NotNil(t, m)
+	require.NoError(t, err)
+	require.Len(t, m, 3)
+	require.Equal(t, "master", m["role"])
+	require.Equal(t, "database", m["type"])
+	require.Equal(t, "mongoDB v1,2", m["ver"])
+
+	// multiple and unicode:
+	m, err = LabelSelectorSpec(`服务器环境=测试,操作系统类别=Linux,机房=华北`)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	require.Len(t, m, 3)
+	require.Equal(t, "测试", m["服务器环境"])
+	require.Equal(t, "Linux", m["操作系统类别"])
+	require.Equal(t, "华北", m["机房"])
+
+	// invalid specs
+	m, err = LabelSelectorSpec(`type="database,"role"=master,ver="mongoDB v1,2"`)
+	require.Nil(t, m)
+	require.Error(t, err)
+	m, err = LabelSelectorSpec(`type="database",role,master`)
+	require.Nil(t, m)
+	require.Error(t, err)
+}
+
+func TestMultiValueLabelSelectorSpec(t *testing.T) {
+	// empty:
+	m, err := MultiValueLabelSelectorSpec("")
+	require.NoError(t, err)
+	require.Empty(t, m)
+
+	// simplest case:
+	m, err = MultiValueLabelSelectorSpec("key=value")
+	require.NotNil(t, m)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(m, map[string][]string{
+		"key": {"value"},
+	}))
+
+	// repeated keys, same values de-dupped:
+	m, err = MultiValueLabelSelectorSpec("env=staging,region=west,region=east,env=prod,fruit=apple,fruit=apple,region=east")
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(m, map[string][]string{
+		"env":    {"staging", "prod"},
+		"region": {"west", "east"},
+		"fruit":  {"apple"},
+	}))
+
+	// unicode, same value unicode de-dupped:
+	m, err = MultiValueLabelSelectorSpec(`服务器环境=测试,操作系统类别=Linux,机房=华北,服务器环境=something,服务器环境=测试`)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(m, map[string][]string{
+		"服务器环境":  {"测试", "something"},
+		"操作系统类别": {"Linux"},
+		"机房":     {"华北"},
+	}))
+
+	// quoting and separators inside quotes:
+	m, err = MultiValueLabelSelectorSpec(`type="database";" role"=master,ver="mongoDB v1,2", type=db2`)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(m, map[string][]string{
+		"type": {"database", "db2"},
+		"role": {"master"},
+		"ver":  {"mongoDB v1,2"},
+	}))
+
+	// invalid specs
+	m, err = MultiValueLabelSelectorSpec(`type="database,"role"=master,ver="mongoDB v1,2"`)
+	require.Nil(t, m)
+	require.Error(t, err)
+	m, err = MultiValueLabelSelectorSpec(`type="database",role,master`)
+	require.Nil(t, m)
+	require.Error(t, err)
+}
+
 // TestVariable tests variable parsing
 func TestVariable(t *testing.T) {
 	t.Parallel()
+	traits := map[string][]string{
+		"foo":   {"foovalue"},
+		"bar":   {"barvalue"},
+		"email": {"user@example.com"},
+	}
 	var tests = []struct {
 		title string
 		in    string
-		err   error
-		out   Expression
+		err   any
+		out   string
 	}{
 		{
 			title: "no curly bracket prefix",
 			in:    "external.foo}}",
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "invalid syntax",
 			in:    `{{external.foo("bar")`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "invalid variable syntax",
 			in:    "{{internal.}}",
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "invalid dot syntax",
 			in:    "{{external..foo}}",
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "empty variable",
 			in:    "{{}}",
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
+		},
+		{
+			title: "string variable",
+			in:    `{{"asdf"}}`,
+			out:   "asdf",
+		},
+		{
+			title: "invalid int variable",
+			in:    `{{123}}`,
+			err:   &trace.BadParameterError{},
+		},
+		{
+			title: "incomplete variables are not allowed",
+			in:    `{{internal}}`,
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "no curly bracket suffix",
 			in:    "{{internal.foo",
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "too many levels of nesting in the variable",
 			in:    "{{internal.foo.bar}}",
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
+		},
+		{
+			title: "too many levels of nesting in the variable with property",
+			in:    `{{internal.foo["bar"]}}`,
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "regexp function call not allowed",
 			in:    `{{regexp.match(".*")}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "valid with brackets",
 			in:    `{{internal["foo"]}}`,
-			out:   Expression{namespace: "internal", variable: "foo"},
+			out:   "foovalue",
 		},
 		{
 			title: "string literal",
 			in:    `foo`,
-			out:   Expression{namespace: LiteralNamespace, variable: "foo"},
+			out:   "foo",
 		},
 		{
 			title: "external with no brackets",
 			in:    "{{external.foo}}",
-			out:   Expression{namespace: "external", variable: "foo"},
+			out:   "foovalue",
+		},
+		{
+			title: "invalid namespaces are allowed",
+			in:    "{{foo.bar}}",
+			out:   "barvalue",
 		},
 		{
 			title: "internal with no brackets",
 			in:    "{{internal.bar}}",
-			out:   Expression{namespace: "internal", variable: "bar"},
+			out:   "barvalue",
 		},
 		{
 			title: "internal with spaces removed",
 			in:    "  {{  internal.bar  }}  ",
-			out:   Expression{namespace: "internal", variable: "bar"},
+			out:   "barvalue",
 		},
 		{
 			title: "variable with prefix and suffix",
 			in:    "  hello,  {{  internal.bar  }}  there! ",
-			out:   Expression{prefix: "hello,  ", namespace: "internal", variable: "bar", suffix: "  there!"},
+			out:   "hello,  barvalue  there!",
 		},
 		{
 			title: "variable with local function",
-			in:    "{{email.local(internal.bar)}}",
-			out:   Expression{namespace: "internal", variable: "bar", transform: emailLocalTransformer{}},
+			in:    "{{email.local(internal.email)}}",
+			out:   "user",
 		},
 		{
 			title: "regexp replace",
-			in:    `{{regexp.replace(internal.foo, "bar-(.*)", "$1")}}`,
-			out: Expression{
-				namespace: "internal",
-				variable:  "foo",
-				transform: &regexpReplaceTransformer{
-					re:          regexp.MustCompile("bar-(.*)"),
-					replacement: "$1",
-				},
-			},
+			in:    `{{regexp.replace(internal.foo, "^(.*)value$", "$1")}}`,
+			out:   "foo",
 		},
 		{
 			title: "regexp replace with variable expression",
 			in:    `{{regexp.replace(internal.foo, internal.bar, "baz")}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "regexp replace with variable replacement",
 			in:    `{{regexp.replace(internal.foo, "bar", internal.baz)}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
+		},
+		{
+			title: "regexp replace constant expression",
+			in:    `{{regexp.replace("abc", "c", "z")}}`,
+			out:   "abz",
+		},
+		{
+			title: "non existing function",
+			in:    `{{regexp.replac("abc", "c", "z")}}`,
+			err:   &trace.BadParameterError{},
+		},
+		{
+			title: "missing args",
+			in:    `{{regexp.replace("abc", "c")}}`,
+			err:   &trace.BadParameterError{},
+		},
+		{
+			title: "no args",
+			in:    `{{regexp.replace()}}`,
+			err:   &trace.BadParameterError{},
+		},
+		{
+			title: "extra args",
+			in:    `{{regexp.replace("abc", "c", "x", "z")}}`,
+			err:   &trace.BadParameterError{},
+		},
+		{
+			title: "invalid arg type",
+			in:    `{{regexp.replace(regexp.match("a"), "c", "x")}}`,
+			err:   &trace.BadParameterError{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.title, func(t *testing.T) {
-			variable, err := NewExpression(tt.in)
+			expr, err := NewTraitsTemplateExpression(tt.in)
 			if tt.err != nil {
-				require.IsType(t, tt.err, err)
+				require.ErrorAs(t, err, &tt.err)
 				return
 			}
-			require.NoError(t, err)
-			require.Equal(t, tt.out, *variable)
+			require.NoError(t, err, trace.DebugReport(err))
+
+			result, err := expr.Interpolate(func(namespace, trait string) error {
+				return nil
+			}, traits)
+			require.NoError(t, err, trace.DebugReport(err))
+
+			require.Len(t, result, 1)
+			require.Equal(t, tt.out, result[0])
 		})
 	}
 }
@@ -149,107 +297,101 @@ func TestVariable(t *testing.T) {
 // TestInterpolate tests variable interpolation
 func TestInterpolate(t *testing.T) {
 	t.Parallel()
+
+	errCheckIsNotFound := func(tt require.TestingT, err error, i ...any) {
+		require.True(tt, trace.IsNotFound(err), "expected not found error, got %v", err)
+	}
+	errCheckIsBadParameter := func(tt require.TestingT, err error, i ...any) {
+		require.True(tt, trace.IsBadParameter(err), "expected bad parameter error, got %v", err)
+	}
 	type result struct {
-		values []string
-		err    error
+		values   []string
+		errCheck require.ErrorAssertionFunc
 	}
 	var tests = []struct {
 		title  string
-		in     Expression
+		in     string
 		traits map[string][]string
 		res    result
 	}{
 		{
 			title:  "mapped traits",
-			in:     Expression{variable: "foo"},
-			traits: map[string][]string{"foo": []string{"a", "b"}, "bar": []string{"c"}},
+			in:     "{{external.foo}}",
+			traits: map[string][]string{"foo": {"a", "b"}, "bar": {"c"}},
 			res:    result{values: []string{"a", "b"}},
 		},
 		{
 			title:  "mapped traits with email.local",
-			in:     Expression{variable: "foo", transform: emailLocalTransformer{}},
-			traits: map[string][]string{"foo": []string{"Alice <alice@example.com>", "bob@example.com"}, "bar": []string{"c"}},
+			in:     "{{email.local(external.foo)}}",
+			traits: map[string][]string{"foo": {"Alice <alice@example.com>", "bob@example.com"}, "bar": {"c"}},
 			res:    result{values: []string{"alice", "bob"}},
 		},
 		{
 			title:  "missed traits",
-			in:     Expression{variable: "baz"},
-			traits: map[string][]string{"foo": []string{"a", "b"}, "bar": []string{"c"}},
-			res:    result{err: trace.NotFound("not found"), values: []string{}},
+			in:     "{{external.baz}}",
+			traits: map[string][]string{"foo": {"a", "b"}, "bar": {"c"}},
+			res:    result{errCheck: errCheckIsNotFound, values: []string{}},
+		},
+		{
+			title:  "legacy user.name trait alias",
+			in:     "{{user.name}}",
+			traits: map[string][]string{"name": {"alice-from-trait"}},
+			res:    result{values: []string{"alice-from-trait"}},
 		},
 		{
 			title:  "traits with prefix and suffix",
-			in:     Expression{prefix: "IAM#", variable: "foo", suffix: ";"},
-			traits: map[string][]string{"foo": []string{"a", "b"}, "bar": []string{"c"}},
+			in:     "IAM#{{external.foo}};",
+			traits: map[string][]string{"foo": {"a", "b"}, "bar": {"c"}},
 			res:    result{values: []string{"IAM#a;", "IAM#b;"}},
 		},
 		{
 			title:  "error in mapping traits",
-			in:     Expression{variable: "foo", transform: emailLocalTransformer{}},
-			traits: map[string][]string{"foo": []string{"Alice <alice"}},
-			res:    result{err: trace.BadParameter("")},
+			in:     "{{email.local(external.foo)}}",
+			traits: map[string][]string{"foo": {"Alice <alice"}},
+			res:    result{errCheck: errCheckIsBadParameter},
 		},
 		{
 			title:  "literal expression",
-			in:     Expression{namespace: LiteralNamespace, variable: "foo"},
-			traits: map[string][]string{"foo": []string{"a", "b"}, "bar": []string{"c"}},
+			in:     "foo",
+			traits: map[string][]string{"foo": {"a", "b"}, "bar": {"c"}},
 			res:    result{values: []string{"foo"}},
 		},
 		{
-			title: "regexp replacement with numeric match",
-			in: Expression{
-				variable: "foo",
-				transform: regexpReplaceTransformer{
-					re:          regexp.MustCompile("bar-(.*)"),
-					replacement: "$1",
-				},
-			},
-			traits: map[string][]string{"foo": []string{"bar-baz"}},
+			title:  "regexp replacement with numeric match",
+			in:     `{{regexp.replace(internal.foo, "bar-(.*)", "$1")}}`,
+			traits: map[string][]string{"foo": {"bar-baz"}},
 			res:    result{values: []string{"baz"}},
 		},
 		{
-			title: "regexp replacement with named match",
-			in: Expression{
-				variable: "foo",
-				transform: regexpReplaceTransformer{
-					re:          regexp.MustCompile("bar-(?P<suffix>.*)"),
-					replacement: "${suffix}",
-				},
-			},
-			traits: map[string][]string{"foo": []string{"bar-baz"}},
+			title:  "regexp replacement with named match",
+			in:     `{{regexp.replace(internal.foo, "bar-(?P<suffix>.*)", "$suffix")}}`,
+			traits: map[string][]string{"foo": {"bar-baz"}},
 			res:    result{values: []string{"baz"}},
 		},
 		{
-			title: "regexp replacement with multiple matches",
-			in: Expression{
-				variable: "foo",
-				transform: regexpReplaceTransformer{
-					re:          regexp.MustCompile("foo-(.*)-(.*)"),
-					replacement: "$1.$2",
-				},
-			},
-			traits: map[string][]string{"foo": []string{"foo-bar-baz"}},
+			title:  "regexp replacement with multiple matches",
+			in:     `{{regexp.replace(internal.foo, "foo-(.*)-(.*)", "$1.$2")}}`,
+			traits: map[string][]string{"foo": {"foo-bar-baz"}},
 			res:    result{values: []string{"bar.baz"}},
 		},
 		{
-			title: "regexp replacement with no match",
-			in: Expression{
-				variable: "foo",
-				transform: regexpReplaceTransformer{
-					re:          regexp.MustCompile("^bar-(.*)$"),
-					replacement: "$1-matched",
-				},
-			},
-			traits: map[string][]string{"foo": []string{"foo-test1", "bar-test2"}},
+			title:  "regexp replacement with no match",
+			in:     `{{regexp.replace(internal.foo, "^bar-(.*)$", "$1-matched")}}`,
+			traits: map[string][]string{"foo": {"foo-test1", "bar-test2"}},
 			res:    result{values: []string{"test2-matched"}},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.title, func(t *testing.T) {
-			values, err := tt.in.Interpolate(tt.traits)
-			if tt.res.err != nil {
-				require.IsType(t, tt.res.err, err)
+			expr, err := NewTraitsTemplateExpression(tt.in)
+			require.NoError(t, err)
+			noVarValidation := func(string, string) error {
+				return nil
+			}
+			values, err := expr.Interpolate(noVarValidation, tt.traits)
+			if tt.res.errCheck != nil {
+				tt.res.errCheck(t, err)
 				require.Empty(t, values)
 				return
 			}
@@ -259,80 +401,201 @@ func TestInterpolate(t *testing.T) {
 	}
 }
 
+func TestInterpolateWithUser(t *testing.T) {
+	t.Parallel()
+
+	expr, err := NewTraitsTemplateExpression("hello-{{user.metadata.name}}")
+	require.NoError(t, err)
+
+	noVarValidation := func(string, string) error {
+		return nil
+	}
+
+	values, err := expr.InterpolateWithUser(noVarValidation, "alice", nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"hello-alice"}, values)
+
+	_, err = expr.InterpolateWithUser(noVarValidation, "", nil)
+	require.True(t, trace.IsNotFound(err), "expected not found error, got %v", err)
+}
+
+func TestInterpolateWithUserPreservesLegacyUserNameTrait(t *testing.T) {
+	t.Parallel()
+
+	expr, err := NewTraitsTemplateExpression("hello-{{user.name}}")
+	require.NoError(t, err)
+
+	noVarValidation := func(string, string) error {
+		return nil
+	}
+
+	values, err := expr.InterpolateWithUser(noVarValidation, "alice", map[string][]string{
+		"name": {"alice-from-trait"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"hello-alice-from-trait"}, values)
+}
+
+// TestVarValidation tests that vars are validated during interpolation.
+func TestVarValidation(t *testing.T) {
+	t.Parallel()
+	var tests = []struct {
+		title         string
+		in            string
+		traits        map[string][]string
+		varValidation func(string, string) error
+		assertErr     require.ErrorAssertionFunc
+	}{
+		{
+			title:  "no validation",
+			in:     "{{external.foo}}",
+			traits: map[string][]string{"foo": {"bar"}},
+			varValidation: func(namespace, name string) error {
+				return nil
+			},
+			assertErr: require.NoError,
+		},
+		{
+			title:  "validate namespace ok",
+			in:     "{{external.foo}}",
+			traits: map[string][]string{"foo": {"bar"}},
+			varValidation: func(namespace, name string) error {
+				if namespace != "external" {
+					return trace.BadParameter("")
+				}
+				return nil
+			},
+			assertErr: require.NoError,
+		},
+		{
+			title:  "validate namespace error",
+			in:     "{{internal.foo}}",
+			traits: map[string][]string{"foo": {"bar"}},
+			varValidation: func(namespace, name string) error {
+				if namespace != "external" {
+					return trace.BadParameter("")
+				}
+				return nil
+			},
+			assertErr: require.Error,
+		},
+		{
+			title:  "variable found",
+			in:     "{{external.foo}}",
+			traits: map[string][]string{"foo": {"bar"}},
+			varValidation: func(namespace, name string) error {
+				return nil
+			},
+			assertErr: require.NoError,
+		},
+		{
+			title:  "variable not found",
+			in:     "{{external.baz}}",
+			traits: map[string][]string{"foo": {"bar"}},
+			varValidation: func(namespace, name string) error {
+				return nil
+			},
+			assertErr: require.Error,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.title, func(t *testing.T) {
+			expr, err := NewTraitsTemplateExpression(tt.in)
+			require.NoError(t, err)
+			_, err = expr.Interpolate(tt.varValidation, tt.traits)
+			tt.assertErr(t, err)
+		})
+	}
+}
+
 func TestMatch(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		title string
 		in    string
-		err   error
-		out   Matcher
+		err   any
+		out   MatchExpression
 	}{
 		{
 			title: "no curly bracket prefix",
 			in:    `regexp.match(".*")}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "no curly bracket suffix",
 			in:    `{{regexp.match(".*")`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "unknown function",
 			in:    `{{regexp.surprise(".*")}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "bad regexp",
 			in:    `{{regexp.match("+foo")}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "unknown namespace",
 			in:    `{{surprise.match(".*")}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
-			title: "unsupported namespace",
+			title: "not a boolean expression",
 			in:    `{{email.local(external.email)}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
-			title: "unsupported variable syntax",
+			title: "not a boolean variable",
 			in:    `{{external.email}}`,
-			err:   trace.BadParameter(""),
+			err:   &trace.BadParameterError{},
 		},
 		{
 			title: "string literal",
 			in:    `foo`,
-			out:   &regexpMatcher{re: regexp.MustCompile(`^foo$`)},
+			out: MatchExpression{
+				matcher: regexpMatcher(`^foo$`),
+			},
 		},
 		{
 			title: "wildcard",
 			in:    `foo*`,
-			out:   &regexpMatcher{re: regexp.MustCompile(`^foo(.*)$`)},
+			out: MatchExpression{
+				matcher: regexpMatcher(`^foo(.*)$`),
+			},
 		},
 		{
 			title: "raw regexp",
 			in:    `^foo.*$`,
-			out:   &regexpMatcher{re: regexp.MustCompile(`^foo.*$`)},
+			out: MatchExpression{
+				matcher: regexpMatcher(`^foo.*$`),
+			},
+		},
+		{
+			title: "regexp.match simple call",
+			in:    `{{regexp.match("foo")}}`,
+			out: MatchExpression{
+				matcher: regexpMatcher(`foo`),
+			},
 		},
 		{
 			title: "regexp.match call",
 			in:    `foo-{{regexp.match("bar")}}-baz`,
-			out: prefixSuffixMatcher{
-				prefix: "foo-",
-				suffix: "-baz",
-				m:      &regexpMatcher{re: regexp.MustCompile(`bar`)},
+			out: MatchExpression{
+				prefix:  "foo-",
+				matcher: regexpMatcher(`bar`),
+				suffix:  "-baz",
 			},
 		},
 		{
 			title: "regexp.not_match call",
 			in:    `foo-{{regexp.not_match("bar")}}-baz`,
-			out: prefixSuffixMatcher{
-				prefix: "foo-",
-				suffix: "-baz",
-				m:      notMatcher{&regexpMatcher{re: regexp.MustCompile(`bar`)}},
+			out: MatchExpression{
+				prefix:  "foo-",
+				matcher: regexpNotMatcher(`bar`),
+				suffix:  "-baz",
 			},
 		},
 	}
@@ -341,13 +604,11 @@ func TestMatch(t *testing.T) {
 		t.Run(tt.title, func(t *testing.T) {
 			matcher, err := NewMatcher(tt.in)
 			if tt.err != nil {
-				require.IsType(t, tt.err, err, err)
+				require.ErrorAs(t, err, &tt.err)
 				return
 			}
 			require.NoError(t, err)
-			require.Empty(t, cmp.Diff(tt.out, matcher, cmp.AllowUnexported(
-				regexpMatcher{}, prefixSuffixMatcher{}, notMatcher{}, regexp.Regexp{},
-			)))
+			require.Equal(t, tt.out, *matcher)
 		})
 	}
 }
@@ -356,37 +617,37 @@ func TestMatchers(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		title   string
-		matcher Matcher
+		matcher string
 		in      string
 		want    bool
 	}{
 		{
 			title:   "regexp matcher positive",
-			matcher: regexpMatcher{re: regexp.MustCompile(`foo`)},
+			matcher: `{{regexp.match("foo")}}`,
 			in:      "foo",
 			want:    true,
 		},
 		{
 			title:   "regexp matcher negative",
-			matcher: regexpMatcher{re: regexp.MustCompile(`bar`)},
+			matcher: `{{regexp.match("bar")}}`,
 			in:      "foo",
 			want:    false,
 		},
 		{
 			title:   "not matcher",
-			matcher: notMatcher{regexpMatcher{re: regexp.MustCompile(`bar`)}},
+			matcher: `{{regexp.not_match("bar")}}`,
 			in:      "foo",
 			want:    true,
 		},
 		{
 			title:   "prefix/suffix matcher positive",
-			matcher: prefixSuffixMatcher{prefix: "foo-", m: regexpMatcher{re: regexp.MustCompile(`bar`)}, suffix: "-baz"},
+			matcher: `foo-{{regexp.match("bar")}}-baz`,
 			in:      "foo-bar-baz",
 			want:    true,
 		},
 		{
 			title:   "prefix/suffix matcher negative",
-			matcher: prefixSuffixMatcher{prefix: "foo-", m: regexpMatcher{re: regexp.MustCompile(`bar`)}, suffix: "-baz"},
+			matcher: `foo-{{regexp.match("bar")}}-baz`,
 			in:      "foo-foo-baz",
 			want:    false,
 		},
@@ -394,8 +655,18 @@ func TestMatchers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.title, func(t *testing.T) {
-			got := tt.matcher.Match(tt.in)
+			matcher, err := NewMatcher(tt.matcher)
+			require.NoError(t, err)
+			got := matcher.Match(tt.in)
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func regexpMatcher(match string) Matcher {
+	return matcher{regexp.MustCompile(match)}
+}
+
+func regexpNotMatcher(match string) Matcher {
+	return notMatcher{regexp.MustCompile(match)}
 }
